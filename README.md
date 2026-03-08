@@ -11,6 +11,7 @@ RSSWorker 是一个轻量级的 RSS 订阅工具，可以部署在 Cloudflare Wo
 - telegram 频道 (/telegram/channel/:username)
 - weibo 用户 (/weibo/user/:uid)
 - 小红书用户 (/xiaohongshu/user/:uid)
+- Anthropic Research Publications (/anthropic/research/publications)
 
 > 小红书更新后不能再使用小红书号，需要使用小红书用户ID。  
 > 获取方法：  
