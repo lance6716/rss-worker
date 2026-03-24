@@ -29,6 +29,70 @@ let parseWeiboCreatedAtToUTCString = (createdAt) => {
 	return d.toUTCString();
 };
 
+// `pics` can be:
+// - empty string
+// - a single Weibo pic pid (e.g. "6efa3a2dgy1..."), sometimes multiple pids joined by comma/pipe
+// - (future-proof) an array of pids or an array/object of pic objects
+let expandWeiboPicUrls = (pics) => {
+	const toPidUrl = (pid) => `https://tvax1.sinaimg.cn/large/${pid}.jpg`;
+
+	if (!pics) {
+		return [];
+	}
+
+	// Object/array forms (not observed on tombkeeper yet, but keep it robust).
+	if (Array.isArray(pics)) {
+		return pics
+			.flatMap((p) => {
+				if (!p) {
+					return [];
+				}
+				if (typeof p === 'string') {
+					return [p];
+				}
+				if (typeof p === 'object') {
+					// Weibo API style: { large: { url } }
+					if (p.large && typeof p.large.url === 'string') {
+						return [p.large.url];
+					}
+					if (typeof p.pid === 'string') {
+						return [toPidUrl(p.pid)];
+					}
+				}
+				return [];
+			})
+			.filter(Boolean);
+	}
+
+	if (typeof pics === 'object') {
+		return Object.values(pics)
+			.flatMap((p) => expandWeiboPicUrls(p))
+			.filter(Boolean);
+	}
+
+	if (typeof pics !== 'string') {
+		return [];
+	}
+
+	const raw = pics.trim();
+	if (raw === '') {
+		return [];
+	}
+
+	// Sometimes the field is a JSON string.
+	if (raw.startsWith('[') && raw.endsWith(']')) {
+		try {
+			const arr = JSON.parse(raw);
+			return expandWeiboPicUrls(arr);
+		} catch (e) {
+			// ignore and fall back to split heuristics
+		}
+	}
+
+	const pids = raw.split(/[\s,|]+/).map((s) => s.trim()).filter(Boolean);
+	return pids.map((pid) => toPidUrl(pid));
+};
+
 let extractNextFlightPayloadFromHtml = (html) => {
 	const marker = 'self.__next_f.push([1,';
 	let idx = 0;
@@ -167,6 +231,7 @@ let buildRssItemsFromWeiboObjects = (weiboObjects) => {
 		const pubDate = parseWeiboCreatedAtToUTCString(w.created_at);
 		const tombkeeperLink = `${BASE_URL}/weibo/${w.id}`;
 		const originalWeiboLink = w.user_id && w.bid ? `https://weibo.com/${w.user_id}/${w.bid}` : undefined;
+		const picUrls = expandWeiboPicUrls(w.pics);
 
 		let title = normalizeText(w.text);
 		if (title.length > 100) {
@@ -190,6 +255,13 @@ let buildRssItemsFromWeiboObjects = (weiboObjects) => {
 			description += `<br><small>赞 ${likes} · 评论 ${comments} · 转发 ${reposts}</small>`;
 		}
 
+		if (picUrls.length > 0) {
+			description += '<br clear="both" /><div style="clear: both"></div>';
+			for (const url of picUrls) {
+				description += `<img src="${url}" /><br>`;
+			}
+		}
+
 		items.push({
 			title: escapeCdata(stripInvalidXmlChars(title)),
 			link: tombkeeperLink,
@@ -198,6 +270,14 @@ let buildRssItemsFromWeiboObjects = (weiboObjects) => {
 			pubDate,
 			author: w.screen_name || undefined,
 			category: 'weibo',
+			enclosure:
+				picUrls.length > 0
+					? {
+							url: picUrls[0],
+							type: 'image/jpeg',
+							length: 0,
+					  }
+					: undefined,
 		});
 	}
 
@@ -279,4 +359,3 @@ let setup = (route) => {
 };
 
 export default { setup };
-
