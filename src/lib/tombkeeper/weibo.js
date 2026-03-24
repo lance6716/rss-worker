@@ -29,12 +29,39 @@ let parseWeiboCreatedAtToUTCString = (createdAt) => {
 	return d.toUTCString();
 };
 
+let normalizeSinaimgHost = (url) =>
+	(url || '').replace(/\/\/wx([1-4])\.sinaimg\.cn\//gi, '//tvax$1.sinaimg.cn/');
+
 // `pics` can be:
 // - empty string
 // - a single Weibo pic pid (e.g. "6efa3a2dgy1..."), sometimes multiple pids joined by comma/pipe
 // - (future-proof) an array of pids or an array/object of pic objects
 let expandWeiboPicUrls = (pics) => {
-	const toPidUrl = (pid) => `https://tvax1.sinaimg.cn/large/${pid}.jpg`;
+	// Note: omitting the extension lets Weibo serve the real content-type (jpg/gif/png/...) transparently.
+	const toPidUrl = (pid) => `https://tvax1.sinaimg.cn/large/${pid}`;
+	const toUrl = (pidOrUrl) => {
+		if (!pidOrUrl) {
+			return undefined;
+		}
+		if (typeof pidOrUrl !== 'string') {
+			return undefined;
+		}
+		const s = pidOrUrl.trim();
+		if (s === '') {
+			return undefined;
+		}
+		if (s.startsWith('https://') || s.startsWith('http://')) {
+			return normalizeSinaimgHost(s);
+		}
+		if (s.startsWith('//')) {
+			return normalizeSinaimgHost(`https:${s}`);
+		}
+		// Only accept plausible pid strings to avoid injecting arbitrary HTML.
+		if (/^[A-Za-z0-9]+$/.test(s)) {
+			return toPidUrl(s);
+		}
+		return undefined;
+	};
 
 	if (!pics) {
 		return [];
@@ -48,15 +75,18 @@ let expandWeiboPicUrls = (pics) => {
 					return [];
 				}
 				if (typeof p === 'string') {
-					return [p];
+					return [toUrl(p)];
 				}
 				if (typeof p === 'object') {
 					// Weibo API style: { large: { url } }
 					if (p.large && typeof p.large.url === 'string') {
-						return [p.large.url];
+						return [toUrl(p.large.url)];
+					}
+					if (typeof p.url === 'string') {
+						return [toUrl(p.url)];
 					}
 					if (typeof p.pid === 'string') {
-						return [toPidUrl(p.pid)];
+						return [toUrl(p.pid)];
 					}
 				}
 				return [];
@@ -90,7 +120,7 @@ let expandWeiboPicUrls = (pics) => {
 	}
 
 	const pids = raw.split(/[\s,|]+/).map((s) => s.trim()).filter(Boolean);
-	return pids.map((pid) => toPidUrl(pid));
+	return pids.map((pidOrUrl) => toUrl(pidOrUrl)).filter(Boolean);
 };
 
 let extractNextFlightPayloadFromHtml = (html) => {
@@ -270,14 +300,8 @@ let buildRssItemsFromWeiboObjects = (weiboObjects) => {
 			pubDate,
 			author: w.screen_name || undefined,
 			category: 'weibo',
-			enclosure:
-				picUrls.length > 0
-					? {
-							url: picUrls[0],
-							type: 'image/jpeg',
-							length: 0,
-					  }
-					: undefined,
+			// RSS enclosure requires a MIME type; since we intentionally omit the extension to support gif/png/etc,
+			// leave it out and rely on <img> tags in the description for broad RSS reader support.
 		});
 	}
 
