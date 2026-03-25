@@ -12,6 +12,67 @@ let stripInvalidXmlChars = (s) => (s || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F
 // Avoid breaking CDATA sections.
 let escapeCdata = (s) => (s || '').replace(/]]>/g, ']]]]><![CDATA[>');
 
+// Escape minimal HTML attribute chars for our injected <a href="...">.
+let escapeHtmlAttr = (s) =>
+	(s || '')
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;');
+
+let isHttpUrl = (s) => typeof s === 'string' && (s.startsWith('https://') || s.startsWith('http://'));
+
+let buildUrlInfoMap = (urlInfo) => {
+	const m = new Map();
+	if (!Array.isArray(urlInfo)) {
+		return m;
+	}
+	for (const info of urlInfo) {
+		if (!info || typeof info !== 'object') {
+			continue;
+		}
+		const shortUrl = typeof info.short_url === 'string' ? info.short_url.trim() : '';
+		if (!isHttpUrl(shortUrl)) {
+			continue;
+		}
+		const longUrl = typeof info.long_url === 'string' ? info.long_url.trim() : '';
+		if (isHttpUrl(longUrl)) {
+			m.set(shortUrl, longUrl);
+		} else {
+			m.set(shortUrl, shortUrl);
+		}
+	}
+	return m;
+};
+
+// Convert plain-text URLs into clickable links.
+// - Prefer url_info.long_url as href when available (keep the displayed text as the original short url).
+// - Keep it simple: only linkify http(s)://... tokens.
+let linkifyUrls = (text, urlInfo) => {
+	if (!text) {
+		return '';
+	}
+	const urlMap = buildUrlInfoMap(urlInfo);
+	const urlRe = /https?:\/\/[^\s<>"']+/g;
+	const trailingPunctRe = /[)\],.!;:'"’”。，；：！？）】》」』]+$/;
+
+	return String(text).replace(urlRe, (raw) => {
+		let url = raw;
+		let trailing = '';
+		const m = url.match(trailingPunctRe);
+		if (m) {
+			trailing = m[0];
+			url = url.slice(0, -trailing.length);
+		}
+
+		const href = urlMap.get(url) || url;
+		if (!isHttpUrl(href)) {
+			return raw;
+		}
+		return `<a href="${escapeHtmlAttr(href)}">${url}</a>${trailing}`;
+	});
+};
+
 let parseWeiboCreatedAtToUTCString = (createdAt) => {
 	if (typeof createdAt !== 'string') {
 		return undefined;
@@ -255,13 +316,68 @@ let extractWeiboIdsFromHtml = (html) => {
 	return Array.from(ids);
 };
 
+let renderWeiboTextHtml = (w) => {
+	const text = stripInvalidXmlChars(w?.text || '');
+	const linked = linkifyUrls(text, w?.url_info);
+	return linked.replace(/\n/g, '<br>');
+};
+
+let renderWeiboMetaHtml = (w, { linkLabel } = {}) => {
+	let html = '';
+	const label = linkLabel || '原微博';
+	const weiboLink = w?.user_id && w?.bid ? `https://weibo.com/${w.user_id}/${w.bid}` : undefined;
+	if (weiboLink) {
+		html += `<br><small>${label}：<a href="${weiboLink}">${weiboLink}</a></small>`;
+	}
+	if (
+		typeof w?.attitudes_count === 'number' ||
+		typeof w?.comments_count === 'number' ||
+		typeof w?.reposts_count === 'number'
+	) {
+		const likes = typeof w.attitudes_count === 'number' ? w.attitudes_count : '-';
+		const comments = typeof w.comments_count === 'number' ? w.comments_count : '-';
+		const reposts = typeof w.reposts_count === 'number' ? w.reposts_count : '-';
+		html += `<br><small>赞 ${likes} · 评论 ${comments} · 转发 ${reposts}</small>`;
+	}
+	return html;
+};
+
+let renderWeiboPicsHtml = (w) => {
+	const picUrls = expandWeiboPicUrls(w?.pics);
+	if (picUrls.length === 0) {
+		return '';
+	}
+	let html = '<br clear="both" /><div style="clear: both"></div>';
+	for (const url of picUrls) {
+		html += `<img src="${url}" /><br>`;
+	}
+	return html;
+};
+
+let renderRetweetBlockHtml = (retweetWeibo) => {
+	if (!retweetWeibo || typeof retweetWeibo !== 'object') {
+		return '';
+	}
+	// Tombkeeper's data structure uses `retweet_weibo` for the original weibo in a repost.
+	let html = '<br clear="both" /><div style="clear: both"></div>';
+	html +=
+		'<blockquote style="background: #80808010;border-top:1px solid #80808030;border-bottom:1px solid #80808030;margin:0;padding:5px 20px;">';
+	if (retweetWeibo.screen_name) {
+		html += `<div><strong>@${retweetWeibo.screen_name}</strong></div>`;
+	}
+	html += renderWeiboTextHtml(retweetWeibo);
+	html += renderWeiboPicsHtml(retweetWeibo);
+	// Keep the link label explicit to avoid confusion with the outer item meta.
+	html += renderWeiboMetaHtml(retweetWeibo, { linkLabel: '被转发微博' });
+	html += '</blockquote>';
+	return html;
+};
+
 let buildRssItemsFromWeiboObjects = (weiboObjects) => {
 	let items = [];
 	for (const w of weiboObjects) {
 		const pubDate = parseWeiboCreatedAtToUTCString(w.created_at);
 		const tombkeeperLink = `${BASE_URL}/weibo/${w.id}`;
-		const originalWeiboLink = w.user_id && w.bid ? `https://weibo.com/${w.user_id}/${w.bid}` : undefined;
-		const picUrls = expandWeiboPicUrls(w.pics);
 
 		let title = normalizeText(w.text);
 		if (title.length > 100) {
@@ -270,27 +386,13 @@ let buildRssItemsFromWeiboObjects = (weiboObjects) => {
 			title = w.screen_name ? `${w.screen_name} - ${w.id}` : w.id;
 		}
 
-		let description = stripInvalidXmlChars(w.text || '').replace(/\n/g, '<br>');
-		if (originalWeiboLink) {
-			description += `<br><small>原微博：<a href="${originalWeiboLink}">${originalWeiboLink}</a></small>`;
+		let description = renderWeiboTextHtml(w);
+		// Include the original weibo content for reposts (tombkeeper shows both on the website).
+		if (w.retweet_weibo) {
+			description += renderRetweetBlockHtml(w.retweet_weibo);
 		}
-		if (
-			typeof w.attitudes_count === 'number' ||
-			typeof w.comments_count === 'number' ||
-			typeof w.reposts_count === 'number'
-		) {
-			const likes = typeof w.attitudes_count === 'number' ? w.attitudes_count : '-';
-			const comments = typeof w.comments_count === 'number' ? w.comments_count : '-';
-			const reposts = typeof w.reposts_count === 'number' ? w.reposts_count : '-';
-			description += `<br><small>赞 ${likes} · 评论 ${comments} · 转发 ${reposts}</small>`;
-		}
-
-		if (picUrls.length > 0) {
-			description += '<br clear="both" /><div style="clear: both"></div>';
-			for (const url of picUrls) {
-				description += `<img src="${url}" /><br>`;
-			}
-		}
+		description += renderWeiboMetaHtml(w);
+		description += renderWeiboPicsHtml(w);
 
 		items.push({
 			title: escapeCdata(stripInvalidXmlChars(title)),
