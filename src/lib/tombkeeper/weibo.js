@@ -90,16 +90,56 @@ let parseWeiboCreatedAtToUTCString = (createdAt) => {
 	return d.toUTCString();
 };
 
-let normalizeSinaimgHost = (url) =>
-	(url || '').replace(/\/\/wx([1-4])\.sinaimg\.cn\//gi, '//tvax$1.sinaimg.cn/');
+// Weibo images are served from several equivalent CDNs (wx1-4 / tvax1-4 / tva1-4).
+// Some networks/readers cannot reach tvax*, so normalize them back to a stable wx* host.
+// Also, tombkeeper's `pics` field sometimes provides a bare pid without extension; some RSS readers
+// don't like extension-less URLs, so we append `.jpg` in that case.
+let normalizeSinaimgImageUrl = (url) => {
+	if (typeof url !== 'string') {
+		return '';
+	}
+	let s = url.trim();
+	if (s === '') {
+		return '';
+	}
+	if (s.startsWith('//')) {
+		s = `https:${s}`;
+	}
+
+	let u;
+	try {
+		u = new URL(s);
+	} catch (e) {
+		// If it isn't a valid URL, keep the original string (caller may treat it as a pid).
+		return url;
+	}
+
+	// Normalize host: tvax*/tva*/wx* -> wx4 (any wx[1-4] works for the same pid).
+	const isWeiboImageHost = /^(?:wx|tvax|tva)[1-4]\.sinaimg\.cn$/i.test(u.hostname);
+	if (isWeiboImageHost) {
+		u.hostname = 'wx4.sinaimg.cn';
+	}
+
+	// Normalize extension: /.../<pid> -> /.../<pid>.jpg (when no extension is present).
+	// Only do this for plausible pid segments to avoid breaking non-image URLs.
+	if (isWeiboImageHost) {
+		const m = u.pathname.match(/^(.*\/)([A-Za-z0-9]+)$/);
+		if (m) {
+			u.pathname = `${m[1]}${m[2]}.jpg`;
+		}
+	}
+
+	return u.toString();
+};
 
 // `pics` can be:
 // - empty string
 // - a single Weibo pic pid (e.g. "6efa3a2dgy1..."), sometimes multiple pids joined by comma/pipe
 // - (future-proof) an array of pids or an array/object of pic objects
 let expandWeiboPicUrls = (pics) => {
-	// Note: omitting the extension lets Weibo serve the real content-type (jpg/gif/png/...) transparently.
-	const toPidUrl = (pid) => `https://tvax1.sinaimg.cn/large/${pid}`;
+	// Tombkeeper usually returns a Weibo picture pid without extension.
+	// Use wx4 + .jpg for best compatibility across RSS readers/networks.
+	const toPidUrl = (pid) => `https://wx4.sinaimg.cn/large/${pid}.jpg`;
 	const toUrl = (pidOrUrl) => {
 		if (!pidOrUrl) {
 			return undefined;
@@ -112,10 +152,14 @@ let expandWeiboPicUrls = (pics) => {
 			return undefined;
 		}
 		if (s.startsWith('https://') || s.startsWith('http://')) {
-			return normalizeSinaimgHost(s);
+			return normalizeSinaimgImageUrl(s);
 		}
 		if (s.startsWith('//')) {
-			return normalizeSinaimgHost(`https:${s}`);
+			return normalizeSinaimgImageUrl(s);
+		}
+		// Sometimes the pid may already include an extension.
+		if (/^[A-Za-z0-9]+\.(?:jpe?g|png|gif|webp)$/i.test(s)) {
+			return normalizeSinaimgImageUrl(`https://wx4.sinaimg.cn/large/${s}`);
 		}
 		// Only accept plausible pid strings to avoid injecting arbitrary HTML.
 		if (/^[A-Za-z0-9]+$/.test(s)) {
@@ -374,8 +418,24 @@ let renderRetweetBlockHtml = (retweetWeibo) => {
 };
 
 let buildRssItemsFromWeiboObjects = (weiboObjects) => {
+	// Tombkeeper embeds the original weibo object for reposts (retweet_weibo / retweet_id).
+	// Our payload walker sees both, but we only want the outer repost as an RSS item.
+	const embeddedRetweetIds = new Set();
+	for (const w of weiboObjects) {
+		if (typeof w?.retweet_id === 'string' && /^\d{5,}$/.test(w.retweet_id)) {
+			embeddedRetweetIds.add(w.retweet_id);
+		}
+		if (typeof w?.retweet_weibo?.id === 'string' && /^\d{5,}$/.test(w.retweet_weibo.id)) {
+			embeddedRetweetIds.add(w.retweet_weibo.id);
+		}
+	}
+
 	let items = [];
 	for (const w of weiboObjects) {
+		if (embeddedRetweetIds.has(w.id)) {
+			continue;
+		}
+
 		const pubDate = parseWeiboCreatedAtToUTCString(w.created_at);
 		const tombkeeperLink = `${BASE_URL}/weibo/${w.id}`;
 
@@ -402,8 +462,7 @@ let buildRssItemsFromWeiboObjects = (weiboObjects) => {
 			pubDate,
 			author: w.screen_name || undefined,
 			category: 'weibo',
-			// RSS enclosure requires a MIME type; since we intentionally omit the extension to support gif/png/etc,
-			// leave it out and rely on <img> tags in the description for broad RSS reader support.
+			// RSS enclosure requires a stable MIME type; rely on <img> tags in the description for broad RSS reader support.
 		});
 	}
 
