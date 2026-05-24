@@ -277,6 +277,158 @@ let extractNextFlightPayloadFromHtml = (html) => {
 	return chunks.join('');
 };
 
+let isHexDigit = (ch) => !!ch && /[0-9a-f]/i.test(ch);
+
+let utf8ByteLengthOfCodePoint = (cp) => {
+	if (cp <= 0x7f) {
+		return 1;
+	}
+	if (cp <= 0x7ff) {
+		return 2;
+	}
+	if (cp <= 0xffff) {
+		return 3;
+	}
+	return 4;
+};
+
+let readUtf8TextByByteLength = (s, start, byteLength) => {
+	let i = start;
+	let bytes = 0;
+	while (i < s.length && bytes < byteLength) {
+		const cp = s.codePointAt(i);
+		const charLength = cp > 0xffff ? 2 : 1;
+		const charBytes = utf8ByteLengthOfCodePoint(cp);
+		if (bytes + charBytes > byteLength) {
+			break;
+		}
+		bytes += charBytes;
+		i += charLength;
+	}
+	return { text: s.slice(start, i), end: i };
+};
+
+// Next.js Flight stores large strings as `id:T<utf8-byte-length>,<raw text>` records.
+let parseNextFlightRecords = (payload) => {
+	const records = new Map();
+	let i = 0;
+
+	while (i < payload.length) {
+		while (payload[i] === '\n') {
+			i++;
+		}
+
+		const idStart = i;
+		while (isHexDigit(payload[i])) {
+			i++;
+		}
+
+		if (i === idStart || payload[i] !== ':') {
+			const nextLine = payload.indexOf('\n', idStart + 1);
+			if (nextLine === -1) {
+				break;
+			}
+			i = nextLine + 1;
+			continue;
+		}
+
+		const id = payload.slice(idStart, i);
+		i++;
+
+		if (payload[i] === 'T') {
+			i++;
+			const lengthStart = i;
+			while (isHexDigit(payload[i])) {
+				i++;
+			}
+			if (payload[i] !== ',') {
+				const nextLine = payload.indexOf('\n', i);
+				if (nextLine === -1) {
+					break;
+				}
+				i = nextLine + 1;
+				continue;
+			}
+
+			const byteLength = parseInt(payload.slice(lengthStart, i), 16);
+			if (Number.isNaN(byteLength)) {
+				const nextLine = payload.indexOf('\n', i);
+				if (nextLine === -1) {
+					break;
+				}
+				i = nextLine + 1;
+				continue;
+			}
+			i++;
+			const { text, end } = readUtf8TextByByteLength(payload, i, byteLength);
+			records.set(id, text);
+			i = end;
+			continue;
+		}
+
+		const valueStart = i;
+		const nextLine = payload.indexOf('\n', valueStart);
+		const valueText = nextLine === -1 ? payload.slice(valueStart) : payload.slice(valueStart, nextLine);
+		const fc = valueText[0];
+
+		if (['{', '[', '"', 'n', 't', 'f', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'].includes(fc)) {
+			try {
+				records.set(id, JSON.parse(valueText));
+			} catch (e) {
+				// Ignore rows that are not standalone JSON values.
+			}
+		}
+
+		if (nextLine === -1) {
+			break;
+		}
+		i = nextLine + 1;
+	}
+
+	return records;
+};
+
+let resolveNextFlightReferences = (value, records, memo = new Map(), resolving = new Set()) => {
+	if (typeof value === 'string') {
+		if (value === '$undefined') {
+			return undefined;
+		}
+
+		const ref = value.match(/^\$([0-9a-f]+)$/i);
+		if (!ref || !records.has(ref[1])) {
+			return value;
+		}
+
+		const id = ref[1];
+		if (memo.has(id)) {
+			return memo.get(id);
+		}
+		if (resolving.has(id)) {
+			return records.get(id);
+		}
+
+		resolving.add(id);
+		const resolved = resolveNextFlightReferences(records.get(id), records, memo, resolving);
+		resolving.delete(id);
+		memo.set(id, resolved);
+		return resolved;
+	}
+
+	if (Array.isArray(value)) {
+		return value.map((item) => resolveNextFlightReferences(item, records, memo, resolving));
+	}
+
+	if (value && typeof value === 'object') {
+		const o = {};
+		for (const [k, v] of Object.entries(value)) {
+			o[k] = resolveNextFlightReferences(v, records, memo, resolving);
+		}
+		return o;
+	}
+
+	return value;
+};
+
 let isProbablyWeiboObject = (o) => {
 	if (!o || typeof o !== 'object') {
 		return false;
@@ -294,8 +446,9 @@ let isProbablyWeiboObject = (o) => {
 };
 
 let extractWeiboObjectsFromFlightPayload = (payload) => {
-	const lines = payload.split('\n');
+	const records = parseNextFlightRecords(payload);
 	const weiboById = new Map();
+	const resolvedMemo = new Map();
 
 	const visit = (v) => {
 		if (!v) {
@@ -324,29 +477,8 @@ let extractWeiboObjectsFromFlightPayload = (payload) => {
 		}
 	};
 
-	for (const line of lines) {
-		const colon = line.indexOf(':');
-		if (colon === -1) {
-			continue;
-		}
-		const valueText = line.slice(colon + 1);
-		const fc = valueText[0];
-		if (!fc) {
-			continue;
-		}
-		// Only attempt to parse JSON-like values.
-		if (!['{', '[', '"', 'n', 't', 'f', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'].includes(fc)) {
-			continue;
-		}
-
-		let parsed;
-		try {
-			parsed = JSON.parse(valueText);
-		} catch (e) {
-			continue;
-		}
-
-		visit(parsed);
+	for (const value of records.values()) {
+		visit(resolveNextFlightReferences(value, records, resolvedMemo));
 	}
 
 	return Array.from(weiboById.values());
